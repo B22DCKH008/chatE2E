@@ -1,0 +1,130 @@
+name: secureai
+
+x-backend-env: &backend-env
+  APP_ENV: development
+  HTTP_ADDR: :8080
+  DATABASE_URL: postgres://${POSTGRES_USER:-secureai}:${POSTGRES_PASSWORD:-secureai_dev_only}@postgres:5432/${POSTGRES_DB:-secureai}?sslmode=disable
+  REDIS_URL: redis://:${REDIS_PASSWORD:-redis_dev_only}@redis:6379/0
+  NATS_URL: nats://${NATS_AUTH_TOKEN:-nats_dev_only}@nats:4222
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  MAX_BODY_BYTES: "1048576"
+  DEPENDENCY_TIMEOUT: 3s
+  SHUTDOWN_TIMEOUT: 10s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-secureai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secureai_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-secureai}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_dev_only}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-redis_dev_only}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  nats:
+    image: nats:2.11.17-alpine@sha256:e4bf19f15fd3218814a4e3c9e0064e1334bd8aa20d5984b9f1a0afd084f8cc00
+    environment:
+      NATS_AUTH_TOKEN: ${NATS_AUTH_TOKEN:-nats_dev_only}
+    command: ["-c", "/etc/nats/nats.conf"]
+    ports:
+      - "127.0.0.1:${NATS_PORT:-4222}:4222"
+    volumes:
+      - ./deploy/nats/nats.conf:/etc/nats/nats.conf:ro
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  setup:
+    image: secureai-backend:local
+    build:
+      context: ./backend
+    entrypoint: ["/app/setup"]
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  api:
+    image: secureai-backend:local
+    build:
+      context: ./backend
+    environment: *backend-env
+    ports:
+      - "127.0.0.1:${API_PORT:-8080}:8080"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    stop_grace_period: 15s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  test:
+    image: golang:1.27.1
+    profiles: [test]
+    working_dir: /workspace/backend
+    environment:
+      <<: *backend-env
+      INTEGRATION_TEST: "1"
+      API_BASE_URL: http://api:8080
+      GOCACHE: /go-build-cache
+      GOMAXPROCS: "2"
+      GOFLAGS: -p=1
+      GOMEMLIMIT: 256MiB
+    volumes:
+      - .:/workspace:ro
+      - go_modules:/go/pkg/mod
+      - go_build:/go-build-cache
+    command: ["go", "test", "-race", "-count=1", "-v", "./..."]
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  nats_data:
+  go_modules:
+  go_build:

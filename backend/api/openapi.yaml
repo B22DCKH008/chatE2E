@@ -1,0 +1,582 @@
+openapi: 3.0.3
+info:
+  title: SecureAI Backend
+  version: 0.1.0
+  description: |
+    Step 1 foundation. Only /health/live and /health/ready are implemented.
+    Operations with x-status=planned are the shared contract for step 2;
+    they currently return 404, not the future success response documented here.
+    The server accepts opaque ciphertext and public keys only.
+    All binary fields use standard padded base64; IDs are UUID strings unless noted.
+servers:
+  - url: http://localhost:8080
+    description: Local development only; production must use HTTPS/WSS.
+security:
+  - bearerAuth: []
+paths:
+  /health/live:
+    get:
+      operationId: liveness
+      x-status: implemented
+      security: []
+      responses:
+        '200':
+          description: HTTP process is responding.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+  /health/ready:
+    get:
+      operationId: readiness
+      x-status: implemented
+      security: []
+      responses:
+        '200':
+          description: PostgreSQL, schema, Redis and the JetStream stream are available.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: One or more dependencies are unavailable; no internal error details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+  /v1/auth/register:
+    post:
+      operationId: register
+      x-owner: identity
+      x-status: planned
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [username, password, device]
+              properties:
+                username: { type: string, pattern: '^[a-z0-9_]{3,32}$' }
+                password: { type: string, minLength: 12, maxLength: 128, writeOnly: true }
+                device: { $ref: '#/components/schemas/DeviceRegistration' }
+      responses:
+        '201': { $ref: '#/components/responses/Tokens' }
+        '409': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/auth/login:
+    post:
+      operationId: login
+      x-owner: identity
+      x-status: planned
+      security: []
+      description: Existing registered device only. New device enrollment is a separate authenticated flow.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [username, password, device_id]
+              properties:
+                username: { type: string }
+                password: { type: string, writeOnly: true }
+                device_id: { type: string, format: uuid }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/auth/refresh:
+    post:
+      operationId: refresh
+      x-owner: identity
+      x-status: planned
+      security: []
+      description: Rotate a single-use refresh token; reuse revokes its token family.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string, writeOnly: true }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/auth/logout:
+    post:
+      operationId: logout
+      x-owner: identity
+      x-status: planned
+      responses:
+        '204': { description: Current session family revoked. }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/devices:
+    post:
+      operationId: enrollDevice
+      x-owner: identity
+      x-status: planned
+      description: Enroll another device for the authenticated account; emit identity-change notifications.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceRegistration' }
+      responses:
+        '201': { description: Device enrolled. }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/users/{user_id}/devices:
+    parameters:
+      - in: path
+        name: user_id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      operationId: listRecipientDevices
+      x-owner: identity
+      x-status: planned
+      description: Authenticated, rate-limited discovery of active public device IDs before claiming key bundles.
+      responses:
+        '200':
+          description: Current active device list; revoked devices are excluded.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [devices]
+                properties:
+                  devices:
+                    type: array
+                    items:
+                      type: object
+                      required: [device_id, identity_version]
+                      properties:
+                        device_id: { type: string, format: uuid }
+                        identity_version: { type: integer, minimum: 1 }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/devices/{device_id}:
+    parameters:
+      - $ref: '#/components/parameters/DeviceID'
+    delete:
+      operationId: revokeDevice
+      x-owner: identity
+      x-status: planned
+      description: Own account only; revoke sessions and prevent new delivery to this device.
+      responses:
+        '204': { description: Device revoked. }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/devices/{device_id}/prekeys:
+    parameters:
+      - $ref: '#/components/parameters/DeviceID'
+    post:
+      operationId: uploadPrekeys
+      x-owner: identity
+      x-status: planned
+      description: Authenticated device must match device_id. Public keys only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [signed_prekey, one_time_prekeys]
+              properties:
+                signed_prekey: { $ref: '#/components/schemas/SignedPrekey' }
+                one_time_prekeys:
+                  type: array
+                  maxItems: 100
+                  items: { $ref: '#/components/schemas/Prekey' }
+      responses:
+        '204': { description: Public prekeys stored. }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/devices/{device_id}/key-bundle/claim:
+    parameters:
+      - $ref: '#/components/parameters/DeviceID'
+    post:
+      operationId: claimKeyBundle
+      x-owner: identity
+      x-status: planned
+      description: |
+        Consumes at most one one-time prekey atomically. POST because this changes state.
+        The client verifies signed-prekey signatures and identity trust.
+        A lost response may consume an unused key; rate limiting is required.
+      responses:
+        '200':
+          description: Public bundle; one_time_prekey is null if exhausted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [device_id, registration_id, identity_key, identity_version, signed_prekey, one_time_prekey]
+                properties:
+                  device_id: { type: string, format: uuid }
+                  registration_id: { type: integer, minimum: 1 }
+                  identity_key: { type: string, format: byte }
+                  identity_version: { type: integer, minimum: 1 }
+                  signed_prekey: { $ref: '#/components/schemas/SignedPrekey' }
+                  one_time_prekey:
+                    type: object
+                    nullable: true
+                    required: [key_id, public_key]
+                    properties:
+                      key_id: { type: integer, format: int64, minimum: 0, maximum: 4294967295 }
+                      public_key: { type: string, format: byte }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/messages:
+    post:
+      operationId: sendMessage
+      x-owner: messaging
+      x-status: planned
+      description: |
+        Authenticate sender from the token. Validate all recipients and group epoch.
+        Atomically insert message, device envelopes and outbox event before acceptance.
+        Same sender device + client_message_id + same semantic payload returns the original acceptance.
+        Same id with a different payload returns 409. 202 does not mean recipient delivery.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendMessage' }
+      responses:
+        '202':
+          description: Ciphertext and outbox event committed durably.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message_id, accepted_at]
+                properties:
+                  message_id: { type: string, format: uuid }
+                  accepted_at: { type: string, format: date-time }
+        '409': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/inbox:
+    get:
+      operationId: listInbox
+      x-owner: messaging
+      x-status: planned
+      description: |
+        Unacknowledged, unexpired envelopes for the authenticated device only.
+        Cursor is opaque and valid only within this pagination pass, never a permanent sync watermark.
+        Start a fresh pass without a cursor after exhausting pages and on every reconnect.
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string, maxLength: 512 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        '200':
+          description: Pending device envelopes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/InboxEnvelope' }
+                  next_cursor: { type: string, nullable: true }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/inbox/acks:
+    post:
+      operationId: ackInbox
+      x-owner: messaging
+      x-status: planned
+      description: |
+        Idempotent ACK after client durably stores the envelope; not a read receipt.
+        Every envelope must belong to the authenticated device. A socket write or NATS ACK is not a device ACK.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [envelope_ids]
+              properties:
+                envelope_ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  uniqueItems: true
+                  items: { type: string, pattern: '^[1-9][0-9]*$' }
+      responses:
+        '204': { description: Device delivery recorded. }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/groups:
+    post:
+      operationId: createGroup
+      x-owner: identity
+      x-status: planned
+      description: Creator becomes owner. Names and avatars are client-encrypted metadata.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [member_user_ids]
+              properties:
+                member_user_ids:
+                  type: array
+                  maxItems: 99
+                  uniqueItems: true
+                  items: { type: string, format: uuid }
+      responses:
+        '201':
+          description: Group created at epoch 1.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupVersion' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/groups/{group_id}:
+    parameters:
+      - $ref: '#/components/parameters/GroupID'
+    get:
+      operationId: getGroup
+      x-owner: identity
+      x-status: planned
+      description: Active members only; read epoch and member list from a consistent database snapshot.
+      responses:
+        '200':
+          description: Group membership snapshot for sender-key distribution.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [group_id, epoch, members]
+                properties:
+                  group_id: { type: string, format: uuid }
+                  epoch: { type: integer, format: int64, minimum: 1 }
+                  members:
+                    type: array
+                    items:
+                      type: object
+                      required: [user_id, role]
+                      properties:
+                        user_id: { type: string, format: uuid }
+                        role: { type: string, enum: [owner, admin, member] }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/groups/{group_id}/members:
+    parameters:
+      - $ref: '#/components/parameters/GroupID'
+    post:
+      operationId: addGroupMember
+      x-owner: identity
+      x-status: planned
+      description: Owner/admin only. Lock group, add member, advance epoch and create outbox event in one transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [user_id, expected_epoch]
+              properties:
+                user_id: { type: string, format: uuid }
+                expected_epoch: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '200':
+          description: New membership epoch; clients rotate and distribute Sender Keys.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupVersion' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/groups/{group_id}/members/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/GroupID'
+      - in: path
+        name: user_id
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      operationId: removeGroupMember
+      x-owner: identity
+      x-status: planned
+      description: Owner/admin or self-leave. Owner must transfer ownership before leaving. Advance epoch atomically.
+      parameters:
+        - in: query
+          name: expected_epoch
+          required: true
+          schema: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '200':
+          description: New group epoch; removed members cannot receive subsequent envelopes.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupVersion' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/realtime/tickets:
+    post:
+      operationId: createRealtimeTicket
+      x-owner: messaging
+      x-status: planned
+      description: Authenticated request creates a single-use device-bound handshake ticket with a 30s lifetime.
+      responses:
+        '201':
+          description: Ticket for the browser WebSocket handshake; never log it.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ticket, expires_in]
+                properties:
+                  ticket: { type: string }
+                  expires_in: { type: integer, enum: [30] }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/realtime:
+    get:
+      operationId: realtime
+      x-owner: messaging
+      x-status: planned
+      security: []
+      description: |
+        WebSocket upgrade with single-use ticket. Validate browser Origin explicitly.
+        Events and acknowledgement semantics are defined in docs/contracts.md.
+      parameters:
+        - in: query
+          name: ticket
+          required: true
+          schema: { type: string }
+      responses:
+        '101': { description: WebSocket established. }
+        default: { $ref: '#/components/responses/Error' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    DeviceID:
+      in: path
+      name: device_id
+      required: true
+      schema: { type: string, format: uuid }
+    GroupID:
+      in: path
+      name: group_id
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Error:
+      description: |
+        JSON error. Common statuses are 400, 401, 403, 404, 409, 413, 415, 429, 500, 503.
+        Rate limiting uses Retry-After. Request ID is also returned in X-Request-ID.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Tokens:
+      description: Device-scoped access token and rotated opaque refresh token.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [user_id, device_id, access_token, refresh_token, expires_in]
+            properties:
+              user_id: { type: string, format: uuid }
+              device_id: { type: string, format: uuid }
+              access_token: { type: string }
+              refresh_token: { type: string }
+              expires_in: { type: integer, minimum: 1, description: Access token lifetime in seconds. }
+  schemas:
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, ready, not_ready] }
+        checks:
+          type: object
+          additionalProperties: { type: string, enum: [ok, unavailable] }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            request_id: { type: string }
+    DeviceRegistration:
+      type: object
+      additionalProperties: false
+      required: [device_id, registration_id, identity_key]
+      properties:
+        device_id: { type: string, format: uuid }
+        registration_id: { type: integer, minimum: 1 }
+        identity_key: { type: string, format: byte, minLength: 4, maxLength: 5464 }
+    Prekey:
+      type: object
+      additionalProperties: false
+      required: [key_id, public_key]
+      properties:
+        key_id: { type: integer, format: int64, minimum: 0, maximum: 4294967295 }
+        public_key: { type: string, format: byte, minLength: 4, maxLength: 5464 }
+    SignedPrekey:
+      type: object
+      additionalProperties: false
+      required: [key_id, public_key, signature]
+      properties:
+        key_id: { type: integer, format: int64, minimum: 0, maximum: 4294967295 }
+        public_key: { type: string, format: byte, minLength: 4, maxLength: 5464 }
+        signature: { type: string, format: byte, minLength: 4, maxLength: 5464 }
+    RecipientEnvelope:
+      type: object
+      additionalProperties: false
+      required: [recipient_device_id, envelope_type, ciphertext]
+      properties:
+        recipient_device_id: { type: string, format: uuid }
+        envelope_type: { type: string, enum: [prekey, signal, sender_key, sender_key_distribution] }
+        ciphertext:
+          type: string
+          format: byte
+          minLength: 4
+          maxLength: 349528
+          description: Opaque serialized Signal/Sender Key message, at most 256 KiB after base64 decoding.
+    SendMessage:
+      type: object
+      additionalProperties: false
+      required: [client_message_id, protocol_version, envelopes]
+      properties:
+        client_message_id: { type: string, format: uuid }
+        protocol_version: { type: integer, enum: [1] }
+        group_id: { type: string, format: uuid }
+        group_epoch: { type: integer, format: int64, minimum: 1 }
+        envelopes:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: '#/components/schemas/RecipientEnvelope' }
+      description: |
+        Entire HTTP body is limited to 1 MiB. Each recipient device must occur once.
+        group_id and group_epoch must both be supplied for groups and both omitted for direct messages.
+        Sender Key distribution uses pairwise encrypted envelopes and the current membership epoch.
+        protocol_version is this transport schema version, not the Signal protocol version.
+    InboxEnvelope:
+      type: object
+      required: [envelope_id, message_id, sender_device_id, envelope_type, ciphertext, accepted_at]
+      properties:
+        envelope_id: { type: string, pattern: '^[1-9][0-9]*$', description: Decimal bigint encoded as string for JavaScript safety. }
+        message_id: { type: string, format: uuid }
+        sender_device_id: { type: string, format: uuid }
+        envelope_type: { type: string, enum: [prekey, signal, sender_key, sender_key_distribution] }
+        ciphertext: { type: string, format: byte }
+        group_id: { type: string, format: uuid, nullable: true }
+        group_epoch: { type: integer, format: int64, nullable: true }
+        accepted_at: { type: string, format: date-time }
+    GroupVersion:
+      type: object
+      required: [group_id, epoch]
+      properties:
+        group_id: { type: string, format: uuid }
+        epoch: { type: integer, format: int64, minimum: 1 }
